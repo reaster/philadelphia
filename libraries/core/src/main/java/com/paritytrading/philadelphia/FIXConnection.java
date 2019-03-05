@@ -1,14 +1,44 @@
 package com.paritytrading.philadelphia;
 
-import static com.paritytrading.philadelphia.FIX.*;
-import static com.paritytrading.philadelphia.FIXMsgTypes.*;
-import static com.paritytrading.philadelphia.FIXSessionRejectReasons.*;
-import static com.paritytrading.philadelphia.FIXTags.*;
+import static com.paritytrading.philadelphia.FIX.BEGIN_STRING;
+import static com.paritytrading.philadelphia.FIX.BEGIN_STRING_FIELD_CAPACITY;
+import static com.paritytrading.philadelphia.FIX.BODY_LENGTH;
+import static com.paritytrading.philadelphia.FIX.BODY_LENGTH_FIELD_CAPACITY;
+import static com.paritytrading.philadelphia.FIX.CHECK_SUM;
+import static com.paritytrading.philadelphia.FIX.CHECK_SUM_FIELD_CAPACITY;
+import static com.paritytrading.philadelphia.FIXMsgTypes.Heartbeat;
+import static com.paritytrading.philadelphia.FIXMsgTypes.Logon;
+import static com.paritytrading.philadelphia.FIXMsgTypes.Logout;
+import static com.paritytrading.philadelphia.FIXMsgTypes.Reject;
+import static com.paritytrading.philadelphia.FIXMsgTypes.ResendRequest;
+import static com.paritytrading.philadelphia.FIXMsgTypes.SequenceReset;
+import static com.paritytrading.philadelphia.FIXMsgTypes.TestRequest;
+import static com.paritytrading.philadelphia.FIXSessionRejectReasons.RequiredTagMissing;
+import static com.paritytrading.philadelphia.FIXSessionRejectReasons.ValueIsIncorrect;
+import static com.paritytrading.philadelphia.FIXTags.BeginSeqNo;
+import static com.paritytrading.philadelphia.FIXTags.EncryptMethod;
+import static com.paritytrading.philadelphia.FIXTags.EndSeqNo;
+import static com.paritytrading.philadelphia.FIXTags.GapFillFlag;
+import static com.paritytrading.philadelphia.FIXTags.HeartBtInt;
+import static com.paritytrading.philadelphia.FIXTags.MsgSeqNum;
+import static com.paritytrading.philadelphia.FIXTags.MsgType;
+import static com.paritytrading.philadelphia.FIXTags.NewSeqNo;
+import static com.paritytrading.philadelphia.FIXTags.PossDupFlag;
+import static com.paritytrading.philadelphia.FIXTags.RefSeqNum;
+import static com.paritytrading.philadelphia.FIXTags.ResetSeqNumFlag;
+import static com.paritytrading.philadelphia.FIXTags.SenderCompID;
+import static com.paritytrading.philadelphia.FIXTags.SendingTime;
+import static com.paritytrading.philadelphia.FIXTags.SessionRejectReason;
+import static com.paritytrading.philadelphia.FIXTags.TargetCompID;
+import static com.paritytrading.philadelphia.FIXTags.TestReqID;
+import static com.paritytrading.philadelphia.FIXTags.Text;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+
 import org.joda.time.DateTimeZone;
 import org.joda.time.MutableDateTime;
 
@@ -26,8 +56,8 @@ public class FIXConnection implements Closeable {
     private final FIXValue bodyLength;
     private final FIXValue checkSum;
 
-    private String senderCompId;
-    private String targetCompId;
+    protected String senderCompId;
+    protected String targetCompId;
 
     private long rxMsgSeqNum;
     private long txMsgSeqNum;
@@ -41,6 +71,18 @@ public class FIXConnection implements Closeable {
     private final ByteBuffer txBodyBuffer;
 
     private final ByteBuffer[] txBuffers;
+    
+    
+    //added to support FIX logging
+    protected FIXValue bodyLengthValue;
+
+    boolean appendToExistingLogs = false;	
+    
+    public final static int FIX_BUFFER_SIZE = 1024 * 16;
+    
+    private byte[] outputLogBuffer = new byte[FIX_BUFFER_SIZE];
+    private ByteBuffer outputLogByteBuffer = ByteBuffer.wrap(outputLogBuffer);
+
 
     /*
      * This variable is written on data reception and read on connection
@@ -73,6 +115,11 @@ public class FIXConnection implements Closeable {
     private final MutableDateTime currentTime;
 
     private final StringBuilder currentTimestamp;
+    
+    private final FIXValue beginString;
+    
+    private final OutputStream outboundLogStream;
+    private final OutputStream inboundLogStream;
 
     /**
      * Create a connection. The underlying socket channel can be either
@@ -85,7 +132,7 @@ public class FIXConnection implements Closeable {
      * @param statusListener the inbound status event listener
      */
     public FIXConnection(Clock clock, SocketChannel channel, FIXConfig config, FIXMessageListener listener,
-            FIXConnectionStatusListener statusListener) {
+            FIXConnectionStatusListener statusListener, OutputStream outboundLogStream, OutputStream inboundLogStream) {
         this.clock = clock;
 
         this.channel = channel;
@@ -97,8 +144,12 @@ public class FIXConnection implements Closeable {
 
         this.senderCompId = config.getSenderCompID();
         this.targetCompId = config.getTargetCompID();
+        
+        this.outboundLogStream = outboundLogStream;
+        this.inboundLogStream = inboundLogStream;
+        MessageInboundLogger inboundLogger = inboundLogStream==null ? null : new MessageInboundLogger(inboundLogStream);
 
-        this.parser = new FIXMessageParser(config, new MessageHandler(listener));
+        this.parser = new FIXMessageParser(config, new MessageHandler(listener, inboundLogger));
 
         this.statusListener = statusListener;
 
@@ -109,9 +160,10 @@ public class FIXConnection implements Closeable {
 
         this.txHeaderBuffer = ByteBuffer.allocateDirect(config.getTxBufferCapacity());
 
-        FIXValue beginString = new FIXValue(BEGIN_STRING_FIELD_CAPACITY);
-
+        beginString = new FIXValue(BEGIN_STRING_FIELD_CAPACITY);
         beginString.setString(config.getVersion().getBeginString());
+        
+        bodyLengthValue = new FIXValue(BODY_LENGTH_FIELD_CAPACITY);
 
         this.txHeaderBuffer.put(BEGIN_STRING);
         beginString.put(this.txHeaderBuffer);
@@ -144,6 +196,22 @@ public class FIXConnection implements Closeable {
         this.currentTimestamp = new StringBuilder(config.getFieldCapacity());
 
         FIXTimestamps.append(this.currentTime, this.currentTimestamp);
+                
+     }
+
+    /**
+     * Create a connection. The underlying socket channel can be either
+     * blocking or non-blocking.
+     *
+     * @param clock the clock
+     * @param channel the underlying socket channel
+     * @param config the connection configuration
+     * @param listener the inbound message listener
+     * @param statusListener the inbound status event listener
+     */
+    public FIXConnection(Clock clock, SocketChannel channel, FIXConfig config, FIXMessageListener listener,
+            FIXConnectionStatusListener statusListener) {
+    	this(clock, channel, config, listener, statusListener, null, null);
     }
 
     /**
@@ -157,7 +225,7 @@ public class FIXConnection implements Closeable {
      */
     public FIXConnection(SocketChannel channel, FIXConfig config, FIXMessageListener listener,
             FIXConnectionStatusListener statusListener) {
-        this(System::currentTimeMillis, channel, config, listener, statusListener);
+        this(System::currentTimeMillis, channel, config, listener, statusListener, null, null);
     }
 
     /**
@@ -365,6 +433,13 @@ public class FIXConnection implements Closeable {
     @Override
     public void close() throws IOException {
         channel.close();
+        System.out.println("FIXConnect close()");
+        if (inboundLogStream != null) {
+        	inboundLogStream.close();
+        }
+        if (outboundLogStream != null && inboundLogStream != outboundLogStream ) {
+        	outboundLogStream.close();
+        }
     }
 
     /**
@@ -418,6 +493,17 @@ public class FIXConnection implements Closeable {
         txBodyBuffer.put(CHECK_SUM);
         checkSum.put(txBodyBuffer);
 
+        if (outboundLogStream != null) {
+        	outputLogByteBuffer.clear();
+            txHeaderBuffer.flip();
+            txBodyBuffer.flip();
+            outputLogByteBuffer.put(txHeaderBuffer);
+            outputLogByteBuffer.put(txBodyBuffer);
+            outboundLogStream.write(outputLogByteBuffer.array(), 0, outputLogByteBuffer.position());
+            outboundLogStream.write('\n');
+            outboundLogStream.flush();
+	    }
+        
         txHeaderBuffer.flip();
         txBodyBuffer.flip();
 
@@ -495,13 +581,51 @@ public class FIXConnection implements Closeable {
         send(txMessage);
     }
 
+    /**
+     * A second FIXMessageListener used for logging inbound messages. 
+     * 
+     * TODO it would be more efficient to copy these bytes from the input stream in FIXMessageParser, but it wasn't obvious how to do that.
+     * 
+     * @author reasterling
+     */
+    private class MessageInboundLogger implements FIXMessageListener {
+
+    	private final OutputStream inboundLogs;
+        private byte[] inputLogBuffer = new byte[FIX_BUFFER_SIZE];
+        private ByteBuffer inputLogByteBuffer = ByteBuffer.wrap(inputLogBuffer);
+    	
+    	public MessageInboundLogger(OutputStream inboundLogs) {
+        	this.inboundLogs = inboundLogs;
+    	}
+    	
+		@Override
+		public void message(FIXMessage message) throws IOException {
+	       	inputLogByteBuffer.clear();
+	       	//need to put the FIX version and a dummy BodyLength value to get the log reader to work
+	       	FIXTags.put(inputLogByteBuffer, FIXTags.BeginString); beginString.put(inputLogByteBuffer);
+	       	bodyLengthValue.setInt(100); //TODO the actual length is buried in FIXMessageParser
+	       	FIXTags.put(inputLogByteBuffer, FIXTags.BodyLength); bodyLengthValue.put(inputLogByteBuffer);
+           
+	       	message.put(inputLogByteBuffer);
+	       	inboundLogs.write(inputLogByteBuffer.array(), 0, inputLogByteBuffer.position());
+	       	inboundLogs.write('\n');
+	       	inboundLogs.flush();
+		}
+    }
+
     private class MessageHandler implements FIXMessageListener {
 
         private FIXMessageListener downstream;
+        private FIXMessageListener inboundLogger;
 
-        MessageHandler(FIXMessageListener downstream) {
+        MessageHandler(FIXMessageListener downstream, FIXMessageListener inboundLogger) {
             this.downstream = downstream;
+            this.inboundLogger = inboundLogger;
         }
+
+//        MessageHandler(FIXMessageListener downstream) {
+//            this(downstream, null);
+//        }
 
         @Override
         public void message(FIXMessage message) throws IOException {
@@ -516,6 +640,10 @@ public class FIXConnection implements Closeable {
                 msgTypeNotFound();
                 return;
             }
+            
+            if (inboundLogger != null) {
+            	inboundLogger.message(message);
+            }
 
             if (msgType.length() == 1 && msgType.byteAt(0) == SequenceReset) {
                 if (handleSequenceReset(message))
@@ -527,7 +655,12 @@ public class FIXConnection implements Closeable {
                 return;
             }
 
-            rxMsgSeqNum++;
+            //rxMsgSeqNum++;
+            if (msgSeqNum > rxMsgSeqNum) { 
+            	rxMsgSeqNum = msgSeqNum; 
+            } else { 
+            	rxMsgSeqNum++; 
+            }
 
             if (msgType.length() != 1) {
                 downstream.message(message);
